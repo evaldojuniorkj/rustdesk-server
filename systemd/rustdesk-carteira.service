@@ -1,0 +1,19 @@
+[Unit]
+Description=Rustdesk Wallet (technician accounts)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rustdesk-carteira
+WorkingDirectory=/var/lib/rustdesk-server/
+Environment=CARTEIRA_BIND=127.0.0.1:21114
+Environment=CARTEIRA_DB=/var/lib/rustdesk-server/carteira.sqlite3
+User=
+Group=
+Restart=always
+StandardOutput=append:/var/log/rustdesk-server/carteira.log
+StandardError=append:/var/log/rustdesk-server/carteira.error
+# Restart service after 10 seconds if node service crashes
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

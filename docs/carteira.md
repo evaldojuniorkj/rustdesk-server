@@ -16,8 +16,8 @@ All bodies are JSON. Errors are `{ "message": "...", "code": "..." }`.
 | POST | `/suporte/contas` | `{nome, email, senha}` | 200 `{token, expiraEm, usuario: {nome}}`, 400, 409 `EMAIL_EM_USO`, 429 |
 | POST | `/suporte/entrar` | `{login, senha}` (login is the e-mail) | 200 as above, 401 `CREDENCIAL_INVALIDA`, 429 |
 | POST | `/suporte/sair` | (Bearer token) | 204 |
-| GET | `/suporte/carteira` | (Bearer token) | 200 `{revisao, dispositivos: [{id, alias, group}]}`, 401 |
-| PUT | `/suporte/carteira` | `{revisao, dispositivos}` | 200 with `revisao + 1`, 409 `CARTEIRA_DESATUALIZADA` when `revisao` is stale |
+| GET | `/suporte/carteira` | (Bearer token) | 200 `{revisao, dispositivos: [{id, alias, group}], grupos}`, 401 |
+| PUT | `/suporte/carteira` | `{revisao, dispositivos, grupos}` | 200 with `revisao + 1`, 409 `CARTEIRA_DESATUALIZADA` when `revisao` is stale |
 
 - E-mail is trimmed and lowercased. Password: 8 to 72 bytes, stored with bcrypt.
 - A session ends after 30 days without use; use slides the expiry. Only the
@@ -25,6 +25,8 @@ All bodies are JSON. Errors are `{ "message": "...", "code": "..." }`.
 - Signup: 5 per IP per hour. Sign-in: 10 attempts per IP and e-mail per 15
   minutes. The client IP comes from `X-Forwarded-For` when the connection is
   from loopback (the reverse proxy).
+- `grupos` lists the networks and branches (`Network / Branch`) created with no
+  device in them yet; it is optional, and a client that omits it saves an empty list.
 - No e-mail confirmation and no password recovery yet.
 
 ## Configuration

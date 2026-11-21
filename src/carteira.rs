@@ -76,6 +76,9 @@ struct Device {
 struct Wallet {
     revisao: i64,
     dispositivos: Vec<Device>,
+    /// Networks and branches created with no device in them yet.
+    #[serde(default)]
+    grupos: Vec<String>,
 }
 
 fn now() -> i64 {
@@ -158,9 +161,19 @@ impl App {
             "create table if not exists carteiras (
                 conta_id integer primary key references contas(id) on delete cascade,
                 revisao integer not null,
-                dispositivos text not null)",
+                dispositivos text not null,
+                grupos text not null default '[]')",
         ] {
             sqlx::query(ddl).execute(&db).await?;
+        }
+        // Wallets created before empty groups existed lack the column.
+        let columns: Vec<(String,)> = sqlx::query_as("select name from pragma_table_info('carteiras')")
+            .fetch_all(&db)
+            .await?;
+        if !columns.iter().any(|(name,)| name == "grupos") {
+            sqlx::query("alter table carteiras add column grupos text not null default '[]'")
+                .execute(&db)
+                .await?;
         }
         let decoy_hash = tokio::task::spawn_blocking(|| bcrypt::hash("decoy", BCRYPT_COST)).await??;
         Ok(Arc::new(App {
@@ -347,8 +360,8 @@ async fn read_wallet(Extension(app): Shared, headers: HeaderMap) -> Response {
         Ok(account) => account,
         Err(response) => return response,
     };
-    let row: Option<(i64, String)> =
-        match sqlx::query_as("select revisao, dispositivos from carteiras where conta_id = ?")
+    let row: Option<(i64, String, String)> =
+        match sqlx::query_as("select revisao, dispositivos, grupos from carteiras where conta_id = ?")
             .bind(account)
             .fetch_optional(&app.db)
             .await
@@ -356,19 +369,27 @@ async fn read_wallet(Extension(app): Shared, headers: HeaderMap) -> Response {
             Ok(row) => row,
             Err(err) => return internal(err),
         };
-    let (revision, devices) = match row {
-        Some((revision, devices)) => match serde_json::from_str::<Value>(&devices) {
-            Ok(devices) => (revision, devices),
-            Err(err) => return internal(err),
-        },
-        None => (0, json!([])),
+    let (revision, devices, groups) = match row {
+        Some((revision, devices, groups)) => {
+            match (serde_json::from_str::<Value>(&devices), serde_json::from_str::<Value>(&groups)) {
+                (Ok(devices), Ok(groups)) => (revision, devices, groups),
+                (Err(err), _) | (_, Err(err)) => return internal(err),
+            }
+        }
+        None => (0, json!([]), json!([])),
     };
-    no_store(json!({ "revisao": revision, "dispositivos": devices }))
+    no_store(json!({ "revisao": revision, "dispositivos": devices, "grupos": groups }))
 }
 
 fn valid_wallet(wallet: &Wallet) -> bool {
     let mut ids = HashSet::new();
+    let mut groups = HashSet::new();
     (0..=MAX_REVISION).contains(&wallet.revisao)
+        && wallet.grupos.len() <= MAX_DEVICES
+        && wallet.grupos.iter().all(|g| {
+            let g = g.trim();
+            !g.is_empty() && g.chars().count() <= 120 && groups.insert(g.to_owned())
+        })
         && wallet.dispositivos.len() <= MAX_DEVICES
         && wallet.dispositivos.iter().all(|d| {
             let id = d.id.trim();
@@ -395,24 +416,26 @@ async fn write_wallet(
     if !valid_wallet(&wallet) {
         return error(StatusCode::BAD_REQUEST, "VALIDACAO", "Carteira inválida");
     }
-    let devices = match serde_json::to_string(&wallet.dispositivos) {
-        Ok(devices) => devices,
-        Err(err) => return internal(err),
+    let (devices, groups) = match (serde_json::to_string(&wallet.dispositivos), serde_json::to_string(&wallet.grupos)) {
+        (Ok(devices), Ok(groups)) => (devices, groups),
+        (Err(err), _) | (_, Err(err)) => return internal(err),
     };
     let next = wallet.revisao + 1;
     // The revision is the lock: two computers writing over the same list, the second is refused
     // instead of erasing the first.
     let written = if wallet.revisao == 0 {
-        sqlx::query("insert or ignore into carteiras (conta_id, revisao, dispositivos) values (?, ?, ?)")
+        sqlx::query("insert or ignore into carteiras (conta_id, revisao, dispositivos, grupos) values (?, ?, ?, ?)")
             .bind(account)
             .bind(next)
             .bind(&devices)
+            .bind(&groups)
             .execute(&app.db)
             .await
     } else {
-        sqlx::query("update carteiras set revisao = ?, dispositivos = ? where conta_id = ? and revisao = ?")
+        sqlx::query("update carteiras set revisao = ?, dispositivos = ?, grupos = ? where conta_id = ? and revisao = ?")
             .bind(next)
             .bind(&devices)
+            .bind(&groups)
             .bind(account)
             .bind(wallet.revisao)
             .execute(&app.db)
@@ -424,7 +447,7 @@ async fn write_wallet(
             "CARTEIRA_DESATUALIZADA",
             "A carteira mudou em outro computador. Atualize a lista e tente novamente.",
         ),
-        Ok(_) => no_store(json!({ "revisao": next, "dispositivos": wallet.dispositivos })),
+        Ok(_) => no_store(json!({ "revisao": next, "dispositivos": wallet.dispositivos, "grupos": wallet.grupos })),
         Err(err) => internal(err),
     }
 }
@@ -535,7 +558,7 @@ mod tests {
             let token = body["token"].as_str().unwrap();
             let (status, wallet) = client.call("GET", "/suporte/carteira", Some(token), Value::Null).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(wallet, json!({"revisao": 0, "dispositivos": []}));
+            assert_eq!(wallet, json!({"revisao": 0, "dispositivos": [], "grupos": []}));
 
             let (status, body) = client
                 .call("POST", "/suporte/entrar", None, json!({"login": "ana@teste.local", "senha": "errada-123"}))
@@ -567,16 +590,17 @@ mod tests {
             let second = body["token"].as_str().unwrap().to_owned();
             let other = client.create("outra@teste.local").await;
             let devices = json!([{"id": "123456", "alias": "Caixa 1", "group": "Empresa / Filial"}]);
+            let groups = json!(["Rede Vazia", "Empresa / Filial Vazia"]);
 
             let (status, saved) = client
-                .call("PUT", "/suporte/carteira", Some(&first), json!({"revisao": 0, "dispositivos": devices}))
+                .call("PUT", "/suporte/carteira", Some(&first), json!({"revisao": 0, "dispositivos": devices, "grupos": groups}))
                 .await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(saved, json!({"revisao": 1, "dispositivos": devices}));
+            assert_eq!(saved, json!({"revisao": 1, "dispositivos": devices, "grupos": groups}));
             assert_eq!(client.call("GET", "/suporte/carteira", Some(&second), Value::Null).await.1, saved);
             assert_eq!(
                 client.call("GET", "/suporte/carteira", Some(&other), Value::Null).await.1,
-                json!({"revisao": 0, "dispositivos": []})
+                json!({"revisao": 0, "dispositivos": [], "grupos": []})
             );
             let (status, _) = client
                 .call("PUT", "/suporte/carteira", Some(&second), json!({"revisao": 0, "dispositivos": []}))
